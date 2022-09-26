@@ -2,18 +2,23 @@
 ;--- AHCI CD/DVD driver,
 ;--- based on R. Loew's AHCICD.SYS,
 ;--- uses "unreal-mode" for extended memory access.
-
-;--- define _TEXT before .model to allow "align 8" & "align 4".
-;--- ( this isn't Masm-compatible! ).
-_TEXT segment para public 'CODE'
-_TEXT ends
+;---
+;--- to make the binary using jwasm:
+;---   jwasm -bin -Fo=ahcicdu.sys ahcicdu.asm
+;---
+;--- to make the binary using MS tools:
+;---   ml -c ahcicdu.asm
+;---   link16 /tiny ahcicdu.obj, ahcicdu.sys;
 
 ?CHECKA20 equ 1	;1=check A20 state on driver entry
+ifndef ?EXTMEM
+?EXTMEM   equ 1
+endif
 
-SECSIZE equ 2048
+SECSIZE equ 2048	; "cooked" mode sector size
+GENINT  equ 1		; 1=generate interrupt if transfer complete
 
-	.model tiny
-	.586p	; p-suffix needed to switch to "unreal" mode
+	.386p	; p-suffix needed to switch to "unreal" mode
 	option casemap:none
 
 DRIVER struct
@@ -24,7 +29,24 @@ ofsInt	dw ?
 name_	db 8 dup (?)
 DRIVER ends
 
-PORT struct
+;--- DOS "Request Packet" header
+
+RPH struct
+Len     db  ?       ;+0 Header byte count.
+bSubU   db  ?       ;+1 Subunit number.
+bOp     db  ?       ;+2 Command code.
+wStat   dw  ?       ;+3 Status field.
+        db 8 dup (?);+5 .. +12 (reserved).
+RPH ends
+
+HBA struct
+dwCAP   dd ?	;+0 HBA capabilities
+dwGHC   dd ?	;+4 global HBA control
+dwIS    dd ?	;+8 interrupt status
+dwPI    dd ?	;+12 ports implemented
+HBA ends
+
+PORT struct		; AHCI port
 dqCLB   dq ?	;+0  Command list base addr ( 1 kB aligned )
 dqFB    dq ?	;+8  (received) FIS base addr ( 256 B aligned )
 dwIS    dd ?	;+16 interrupt status
@@ -40,7 +62,7 @@ dwSACT  dd ?	;+52 SATA active
 dwCI    dd ?	;+56 command issued
 PORT ends
 
-CLH struct
+CLH struct		; command list header
 flags1  db ?	;+0  P[7]=Prefetchable, W[6]=Write, A[5]=ATAPI, CFL[4:0]=Command FIS Length
 flags2  db ?	;+1  PMP[15:12]=Port Multiplier Port, R[11]=Reserved, C[10]=Clear Busy, B[9]=BIST, R[8]=Reset
 PRDTL   dw ?	;+2  Physical Region Descriptor Table Length
@@ -50,9 +72,32 @@ dwCTBAU dd ?	;+12 Command Table Base Address bits 32-63
 	dd 4 dup (?)
 CLH ends
 
-	.code
+PRDT struct
+dwBase   dd ?	;+0 base - must be word aligned (bit 0 is "reserved")
+dwBaseU  dd ?	;+4 base upper
+dwRsvd   dd ?	;+8 reserved
+dwCnt    dd ?	;+12 cnt ( bits 0-30: size - 1, that is, 7 means: transfer 8 bytes ); bit 31: 1=cause interrupt if done
+PRDT ends
+
+CT struct		; command table
+cfis0  dd ?
+cfis1  dd ?
+cfis2  dd ?
+cfis3  dd ?
+       db 30h dup (?)
+Pkt0   dd ?		; 40h=offset ATAPI in command table
+Pkt1   dd ?
+Pkt2   dd ?
+       dd ?		; Packets are 12/16 bytes
+       db 30h dup (?)
+p0     PRDT <>	; 80h=offset PRDT in command table
+CT ends
 
 	assume ds:nothing,ss:nothing
+
+_TEXT segment use16 para public 'CODE'
+
+DGROUP group _TEXT
 
 base DRIVER <-1, 0C800H, offset STRAT, offset ENTRY, 'CD1$$$$$'>
 
@@ -69,7 +114,7 @@ gdt label qword
 
 SEL_FLAT equ 8
 
-gdtr dw 2*8-1,0,0
+gdtr dw 2*8-1,offset gdt-8,0
 
 ;--- cmds 00-0E
 VECTOR  DW INIT,ERROR3,ERROR3,IOCTLI,ERROR3,ERROR3,ERROR3,ERROR3
@@ -99,7 +144,6 @@ STRAT proc
 STRAT endp
 
 ENTRY proc
-	CLD
 	PUSHAD
 	PUSH DS
 	PUSH ES
@@ -108,13 +152,14 @@ ENTRY proc
 	push 0
 	pop ds
 	mov bx, cs
+	mov eax, ds:[13*4]
 	shl ebx, 16
 	mov bx, offset int0d
-	xchg ebx, ds:[13*4]
-	mov cs:[oldint0d], ebx
+	mov cs:[oldint0d], eax
+	mov ds:[13*4], ebx
 
 	LES BX, CS:[dwReq]
-	cmp byte ptr ES:[BX+2], 0
+	cmp ES:[BX].RPH.bOp, 0	;Init?
 	JZ NOUNIT
 if ?CHECKA20
 	mov ecx, ds:[0]
@@ -126,14 +171,13 @@ if ?CHECKA20
 	pop bx
 @@:
 endif
-	mov al, ES:[BX+1]
+	mov al, ES:[BX].RPH.bSubU
 	mov cs:[bUnit], al
 	cmp AL, CS:[bCount]
 	MOV AL, 1
 	JNC ERRORX
 NOUNIT:
-	SUB AH, AH
-	MOV AL, ES:[BX+2]
+	movzx ax, ES:[BX].RPH.bOp
 	ADD AL, AL
 	JC HIGHV
 	CMP AL, LVECTOR
@@ -161,7 +205,7 @@ EXIT1:
 	pop dword ptr ds:[13*4]
 	MOV [bp+2*2+7*4], AX
 	LDS BX, CS:[dwReq]
-	MOV [BX+3], AX
+	MOV [BX].RPH.wStat, AX
 	POP ES
 	POP DS
 	POPAD
@@ -169,38 +213,38 @@ EXIT1:
 ENTRY endp
 
 ;--- IOCTL input
+;--- es:[bx+14]=transfer addr
 
 IOCTLI proc
 	LES SI, ES:[BX+14]
-	MOV AL, ES:[SI]
+	MOV AL, ES:[SI+0]
 	CMP AL, LIVEC
 	JNC ERROR3
-	MOV DI, OFFSET IVEC
 	ADD AL, AL
-	SUB AH, AH
-	ADD DI, AX
-	JMP WORD PTR CS:[DI]
+	movzx di, al
+	call CS:[DI][IVEC]
+	jmp EXIT
 IOCTLI endp
 
 IOC_GETHDR:
 	MOV WORD PTR ES:[SI+1], 0
 	MOV ES:[SI+3], CS
-	JMP EXIT
+	ret
 
 IOC_DEVST:
 	MOV DWORD PTR ES:[SI+1], 2		; DOOR LOCK ? OPEN=1 UNLOCK=2
-	JMP EXIT
+	ret
 
 IOC_SECSIZ:
 	MOV WORD PTR ES:[SI+2], SECSIZE
-	JMP EXIT
+	ret
 
 IOC_MEDIA proc
 	PUSH SI
 	CALL SETUP
-	mov dword ptr [edi+40h], 14AH	; ACMD.00: 4A,01,00,00
-	mov dword ptr [edi+44H], 10H	; ACMD.04: 10,00,00,00
-	mov dword ptr [edi+48H], 8		; ACMD.08: 08,00,00,00
+	mov [edi].CT.Pkt0, 14AH	; ACMD.00: 4A,01,00,00 (4A=get event status notification)
+	mov [edi].CT.Pkt1, 10H	; ACMD.04: 10,00,00,00
+	mov [edi].CT.Pkt2, 8	; ACMD.08: 08,00,00,00
 	CALL REQ8
 	POP SI
 	AND AL, AL
@@ -227,15 +271,18 @@ MEDEND:
 	mov al, [eax][2]
 
 	AND AL, 15
-	JZ EXIT
+	JZ @F
 	MOV BYTE PTR ES:[SI+1], 0
 	CMP AL, 6
 	JZ MEDEND
-	JMP EXIT
+@@:
+	ret
 IOC_MEDIA endp
 
 ;--- Read long (cmd 128)
 ;--- Request struct: +1=UNIT +14=ADDRESS +18=SEC COUNT +20=START SEC
+;--- the read is always done thru the sector buffer.
+;--- it's possible to read directly into the dst buffer if it's word-aligned.
 
 READLS struct
 	org -10
@@ -261,41 +308,40 @@ READLP:
 	SHR ECX, 16
 	XCHG CL, CH
 	SHL ECX, 16
-	MOV CX, 28H		; ACMD.00: 28h,00,SECTOR.04,SECTOR.03
-	mov [edi+40h], ecx
+	MOV CX, 28H
+	mov [edi].CT.Pkt0, ecx	; ACMD.00: 28h,00,SECTOR.04,SECTOR.03 (28=read cooked)
 	MOVZX ECX, WORD PTR [bp].READLS.dwSector+0
-	XCHG CL, CH			; ACMD.04: SECTOR.02, SECTOR.01
-	mov [edi+44h], ecx
-	mov dword ptr [edi+48h], 1			; ACMD.08: 01,00,00,00 
-	mov dword ptr [edi+8Ch], 800007FFH	; PRDT.0C: FF,07,00,80
-	CALL DOIT
+	XCHG CL, CH
+	mov [edi].CT.Pkt1, ecx	; ACMD.04: SECTOR.02, SECTOR.01
+	mov [edi].CT.Pkt2, 1	; ACMD.08: 01,00,00,00 
+	mov ecx, (GENINT shl 31) or ( SECSIZE - 1 )	; value for PRDT.dwCnt
+	CALL REQECX
 	AND AL, AL
-	JZ GOOD
-	CALL SETUP
-	CALL REQSEN
-	AND AL, AL
-	JNZ ERRORX
-
-	mov eax, cs:[pBuff]
-	mov al, [eax][2]
-
-	AND AL, 15
-	mov BX, OFFSET ERRTAB
-	XLAT cs:[bx]
-	JMP ERRORX
-
-GOOD:
+	JNZ rl_error
 	MOV ECX, SECSIZE shr 2
 	LES DI, [bp].READLS.pXfer
 	movzx edi, di
 	mov esi, cs:[pBuff]
 	CLD
 	REP MOVSD es:[edi], ds:[esi]
-
 	ADD WORD PTR [bp].READLS.pXfer+2, SECSIZE shr 4
 	INC [bp].READLS.dwSector
 	DEC [bp].READLS.wSecCnt
 	JMP READLP
+
+rl_error:
+	CALL SETUP
+	CALL REQSEN
+	AND AL, AL
+	JNZ @F
+	mov eax, cs:[pBuff]
+	mov al, [eax][2]
+	AND AL, 15
+	mov BX, OFFSET ERRTAB
+	XLAT cs:[bx][ERRTAB]
+@@:
+	JMP ERRORX
+
 READL endp
 
 ;--- setup command list, command table, port.CMD
@@ -305,32 +351,29 @@ READL endp
 
 SETUP proc
 	MOV AL, CS:[bUnit]
-	mov AH, 0
 	ADD AL, AL
-	mov SI, AX
+	movzx si, al
 	MOVZX ESI, CS:[si][wPorts]
 	add esi, cs:[pHBA]
 	add al, al
 
 	mov edx, dword ptr [esi].PORT.dqCLB		; get command list base
 	mov edi, [edx].CLH.dwCTBA				; get command table base address
-	mov dword ptr [edx].CLH.flags1, 10025H	; CL.00: 25,00,01,00 [CFL=5 dwords, A=1,PRDTL=1]
-	mov dword ptr [edx].CLH.PRDBC, 0		; CL.04: 00,00,00,00 [PRDBC=0]
+	mov dword ptr [edx].CLH.flags1, 10025H	; 25,00,0001 [CFL=5 dwords, A=1,PRDTL=1]
+	mov [edx].CLH.PRDBC, 0
 
-	mov dword ptr [edi+0], 1A08027H	; CT.00: 27,80,A0,01 [27=H2D register FIS,80=set command register,A0=ATAPI packet command,01=Features]
-	mov dword ptr [edi+4], 0FFFF00H	; CT.04: 00,FF,FF,00 [LBA low,mid,high,device]
-	XOR ECX, ECX
-	mov [edi+8], ecx	; CT.08: 00,00,00,00 [LBA (exp) low,mid,high,features]
-	MOV ECX, 1
-	mov [edi+12], ecx	; CT.0C: 01,00,00,00 [sector count, sector count,res,control]
+	mov [edi].CT.cfis0, 1A08027H	; 27,80,A0,01 [27=H2D register FIS,80=set command register,A0=ATAPI packet command,01=Features]
+	mov [edi].CT.cfis1, 0FFFF00H	; 00,FF,FF,00 [LBA low,mid,high,device]
+	mov [edi].CT.cfis2, 0			; 00,00,00,00 [LBA (exp) low,mid,high,features]
+	mov [edi].CT.cfis3, 1			; 01,00,00,00 [sector count, sector count,res,control]
 	MOV ECX, CS:[pBuff]
-	mov [edi+80h], ecx	; CT.PRDT.base+0
+	mov [edi].CT.p0.dwBase, ecx
 	XOR ECX, ECX
-	mov [edi+84h], ecx	; CT.PRDT.base+4
-	mov [edi+88h], ecx	; CT.PRDT.reserved
+	mov [edi].CT.p0.dwBaseU, ecx
+	mov [edi].CT.p0.dwRsvd, ecx
 	XOR ECX, ECX
 	mov [esi].PORT.dwIE, ecx
-	MOV ECX, -1
+	or ECX, -1
 	mov [esi].PORT.dwIS, ecx
 	mov [esi].PORT.dwSERR, ecx
 	mov ecx, [esi].PORT.dwCMD
@@ -345,30 +388,36 @@ WAITST:
 	RET
 SETUP endp
 
+;--- start transfer from ATAPI device
+;--- REQSEN: request sense notification
+;--- REQ8:   entry for IOC_MEDIA
+;--- REQECX: entry for READL
+
 REQSEN:
-	mov dword ptr [edi+40h], 3	; ACMD.00: 03,00,00,00
-	mov dword ptr [edi+44h], 8	; ACMD.04: 08,00,00,00
-	mov dword ptr [edi+48h], 0	; ACMD.08: 00,00,00,00
+	mov [edi].CT.Pkt0, 3	; ACMD.00: 03,00,00,00 (03=request sense)
+	mov [edi].CT.Pkt1, 8	; ACMD.04: 08,00,00,00
+	mov [edi].CT.Pkt2, 0	; ACMD.08: 00,00,00,00
 REQ8:
-	mov dword ptr [edi+8Ch], 80000007H	; PRDT.0C: 07,00,00,80 (PRC=7 transfer 8 bytes, 80=I)
-DOIT:
-	mov dword ptr [esi+38h], 1	;P.CI
+	mov ecx, (GENINT shl 31) or (8-1)	; PRDT.dwCnt: 0000007 (transfer 8 bytes, I)
+REQECX:						; <--- entry, ECX=PRDT.dwCnt
+	mov [edi].CT.p0.dwCnt, ecx
+	mov [esi].PORT.dwCI, 1
 WAITEN:
-	mov eax, [esi+38h]	;P.CI
+	mov eax, [esi].PORT.dwCI
 	AND EAX, EAX
-	JZ	FIN
-	mov eax, [esi+10h]	;P.IS
+	JZ FIN
+	mov eax, [esi].PORT.dwIS
 	TEST EAX, 40000000H	;P.IS.30
 	JNZ FINERR
-	mov eax, [esi+30h]	;P.SERR
+	mov eax, [esi].PORT.dwSERR
 	AND EAX, EAX
 	JZ WAITEN
 FINERR:
 	CALL STOP
-	MOV  AL, 12
+	MOV AL, 12
 	JMP PROCER
 FIN:
-	mov  eax, [esi+20h]	;P.TFD
+	mov eax, [esi].PORT.dwTFD
 	TEST AL, 1
 	JNZ FINERR
 	CALL STOP
@@ -377,10 +426,10 @@ PROCER:
 	RET
 
 STOP:
-	mov ecx, [esi+18h]
+	mov ecx, [esi].PORT.dwCMD
 	OR CL, 8
 	AND CL, 0EEH
-	mov [esi+18h], ecx
+	mov [esi].PORT.dwCMD, ecx
 	RET
 
 ;--- handle exception 0D
@@ -421,45 +470,40 @@ dwReq DD 0	; current request packet
 
 ENDRES label byte
 
-	.code _ITEXT
+_TEXT ends
+
+_ITEXT segment use16 word public 'CODE'
 
 DGROUP group _ITEXT
 
 bDev    db 0		; /C cmdline option default
 bQuiet  db 0		; /Q cmdline option
 
-GETPCI proc
-	PUSH EDX 		;EDX = ADDR+80000000
-	PUSH EBX
-	PUSH EDX
+GETPCI proc		;ECX = index
+	mov eax, ecx
 	MOV DX, 0CF8H
-	IN EAX, DX
-	MOV EBX, EAX
-	POP EAX
 	OUT DX, EAX
 	MOV DL, 0FCH
 	IN EAX, DX
-	MOV DL, 0F8H
-	PUSH EAX
-	MOV EAX, EBX
-	OUT DX, EAX
-	POP EAX
-	POP EBX
-	POP EDX
+	mov dl, 0F8h
 	RET
 GETPCI endp
 
 INIT proc
 
+	mov eax, cs
+	shl eax, 4
+	add dword ptr cs:[gdtr+2], eax	;set GDTR linear address
 	MOV WORD PTR ES:[BX+14], OFFSET ENDRES
 	LDS SI, ES:[BX+12H]
+	CLD
 
 ;--- skip driver path & name
 
-@@:
+nextsp:
 	lodsb
 	cmp al, ' '
-	ja @B
+	ja nextsp
 	dec si
 
 ;--- scan arguments
@@ -494,7 +538,7 @@ isOptD:
 	MOV DI, DRIVER.name_
 	mov cx, sizeof DRIVER.name_
 	pusha
-	mov al,' '
+	mov al, ' '
 	rep stosb
 	popa
 nextdevchar:
@@ -517,11 +561,10 @@ doneOptD:
 isOptC:
 	inc si
 	lodsb
-	cmp al, '0'
-	jb errcmdl
-	cmp al, '9'
-	Ja errcmdl
 	sub al, '0'
+	jb errcmdl
+	cmp al, 9
+	Ja errcmdl
 	mov cs:[bDev], al
 	jmp nextchar
 isOptQ:
@@ -539,31 +582,38 @@ donecmdl:
 	INT 21H
 @@:
 
+	smsw ax
+	test ax, 1
+	jnz errnov86
+
 ;--- scan PCI for AHCI controllers
 
-	MOV EDX, 80000008H
+	MOV DX, 0CF8H
+	IN EAX, DX
+	MOV EBX, EAX
+	MOV ECX, 80000008H
 FNDHBA:
 	CALL GETPCI
 	AND EAX, 0FFFFFF00H
 	CMP EAX, 1060100H
 	JZ GOTHBA
 NXTHBA:
-	ADD EDX, 100H
-	CMP EDX, 81000008H
+	ADD ECX, 100H
+	CMP ECX, 81000008H
 	JC FNDHBA
+	mov eax, ebx
+	out dx, eax
 	JMP NG
 GOTHBA:
 	DEC cs:[bDev]
 	JNS NXTHBA
 
-	smsw ax
-	test ax, 1
-	jnz errnov86
-	mov dl, 24h	;get ABAR5
+	mov cl, 24h	;get ABAR5
 	call GETPCI
 	mov cs:[pHBA], eax
-
 	mov esi, eax
+	mov eax, ebx
+	out dx, eax
 
 ;--- get XMS address and enable A20
 
@@ -578,25 +628,17 @@ GOTHBA:
 	mov ah, 5				; local enable A20
 	call cs:[xmmad]
 
-
-;--- prepare "unreal" mode
-
-	mov eax, cs
-	shl eax, 4
-	add eax, offset gdt-8
-	mov dword ptr cs:[gdtr+2], eax	;set GDTR linear address
-	PUSH 0
-	POP DS
-
 ;--- first usage of "unreal" mode
 
-	mov eax, [esi+4]
+	PUSH 0
+	POP DS
+	mov eax, [esi].HBA.dwGHC
 	TEST EAX, 80000000H		; AHCI enabled?
 	JZ INACT
 
 ;--- scan ports
 
-	mov ebx, [esi+0Ch]		; get port bitmask
+	mov ebx, [esi].HBA.dwPI	; get port bitmask
 	mov edx, 100h
 	xor cx, cx
 	mov di, offset wPorts
@@ -608,10 +650,10 @@ contport:
 	add dx, 80h
 	jmp nextport
 foundport:
-	mov eax, [esi+edx+24h]
+	mov eax, [esi+edx].PORT.dwSIG
 	cmp eax, 0EB140101H		; ATAPI device?
 	jnz contport
-	mov eax, [esi+edx+28h]
+	mov eax, [esi+edx].PORT.dwSSTS
 	and al, 0fh
 	cmp al, 3				; communication established?
 	jnz contport
@@ -695,11 +737,11 @@ else
 
 	xor ecx, ecx
 	xor eax, eax
-@@:
+nextdw:
 	mov [esi+ecx*4], eax
 	inc cx
 	cmp cx, 500h/4
-	jnz @B
+	jnz nextdw
 	lea eax, [esi+500h]
 	mov [esi].CLH.dwCTBA, eax
 endif
@@ -730,8 +772,8 @@ NG1:
 	POP DS
 	MOV AH, 9
 	INT 21H
+	MOV ds:[base.wAttr], 0
 	pop ds
-	MOV CS:[base.wAttr], 0
 	JMP ERROR3
 
 INIT endp
@@ -749,5 +791,7 @@ msg7    DB 'No XMM installed',13,10,'$'
 if ?EXTMEM
 msg8    DB 'Alloc extended memory failed',13,10,'$'
 endif
+
+_ITEXT ends
 
 	END
